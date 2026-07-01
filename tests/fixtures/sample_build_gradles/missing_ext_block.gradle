@@ -1,0 +1,2 @@
+// This file has no ext block — unparseable
+apply plugin: "kei.plugins.extension.legacy"
