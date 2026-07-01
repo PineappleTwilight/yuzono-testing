@@ -103,11 +103,20 @@ def setup_logging(verbosity: int) -> None:
     elif verbosity >= 2:
         level = logging.DEBUG
 
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    root = logging.getLogger()
+    root.setLevel(level)
+
+    if not root.handlers:
+        handler = logging.StreamHandler()
+        handler.setLevel(level)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        root.addHandler(handler)
+    else:
+        for h in root.handlers:
+            h.setLevel(level)
 
 
 def main(argv: list[str] | None = None) -> int:
