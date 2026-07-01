@@ -200,4 +200,4 @@ python -m anime_ext_test --languages tr --format all -vv
 
 ## License
 
-This testing suite is provided as-is for validating the anime-extensions project. It is not affiliated with or endorsed by the anime-extensions maintainers.
+This testing suite is provided as-is for validating the anime-extensions project.
