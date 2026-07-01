@@ -1,0 +1,305 @@
+name: Test Anime Extensions
+
+on:
+  schedule:
+    - cron: "0 0 * * 1"
+  workflow_dispatch:
+    inputs:
+      languages:
+        description: "Languages to test (space-separated, empty = all)"
+        required: false
+        default: ""
+      categories:
+        description: "Test categories to run (space-separated, empty = all)"
+        required: false
+        default: ""
+      max_concurrent:
+        description: "Max concurrent HTTP requests"
+        required: false
+        default: "20"
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "requirements.txt"
+      - ".github/workflows/test-extensions.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+  pages: write
+  id-token: write
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  detect-languages:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Detect language groups
+        id: set-matrix
+        run: |
+          python -c "
+          import json
+          from anime_ext_test.discovery import clone_repo, discover_languages
+          from anime_ext_test.config import Config
+          from pathlib import Path
+
+          config = Config()
+          repo_dir = Path('repo')
+          if not repo_dir.exists():
+              clone_repo(config, repo_dir)
+
+          langs = discover_languages(repo_dir)
+          large = [l for l in langs if l in ('es', 'en', 'pt', 'all')]
+          medium = [l for l in langs if l in ('src', 'ar', 'fr', 'de')]
+          small = [l for l in langs if l not in large and l not in medium]
+
+          groups = []
+          for l in large:
+              groups.append({'name': l, 'languages': l})
+          if medium:
+              groups.append({'name': 'medium-langs', 'languages': ' '.join(medium)})
+          if small:
+              groups.append({'name': 'small-langs', 'languages': ' '.join(small)})
+
+          print(f'matrix={json.dumps(groups)}')
+          " >> "$GITHUB_OUTPUT"
+
+  test-extensions:
+    needs: detect-languages
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJson(needs.detect-languages.outputs.matrix) }}
+    name: "Test ${{ matrix.group.name }}"
+
+    steps:
+      - name: Checkout testing suite
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run extension tests
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          ARGS="--format all --output-dir ./reports --max-concurrent ${{ github.event.inputs.max_concurrent || '20' }}"
+          LANGS="${{ matrix.group.languages }}"
+          if [ -n "${{ github.event.inputs.languages }}" ]; then
+            ARGS="$ARGS --languages ${{ github.event.inputs.languages }}"
+          elif [ -n "$LANGS" ]; then
+            ARGS="$ARGS --languages $LANGS"
+          fi
+          if [ -n "${{ github.event.inputs.categories }}" ]; then
+            ARGS="$ARGS --categories ${{ github.event.inputs.categories }}"
+          fi
+          python -m anime_ext_test $ARGS -vv || true
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-${{ matrix.group.name }}
+          path: reports/
+          retention-days: 30
+
+  aggregate-reports:
+    needs: test-extensions
+    runs-on: ubuntu-latest
+    if: always()
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout testing suite
+        uses: actions/checkout@v4
+
+      - name: Download all report artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-reports
+          pattern: reports-*
+
+      - name: Merge reports and compute summary
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Merge reports
+        run: |
+          python -c "
+          import json, glob, os
+          from pathlib import Path
+          from anime_ext_test.models import RunReport, RunSummary
+
+          all_reports_dir = Path('all-reports')
+          merged_exts = []
+          run_id = None
+          started_at = None
+          finished_at = None
+          repo_url = ''
+          repo_commit = ''
+
+          for json_file in sorted(all_reports_dir.rglob('report-*.json')):
+              data = json.loads(json_file.read_text())
+              report = RunReport.model_validate(data)
+              if run_id is None:
+                  run_id = report.run_id
+                  started_at = report.started_at
+                  repo_url = report.repo_url
+                  repo_commit = report.repo_commit
+              merged_exts.extend(report.extensions)
+              if report.finished_at:
+                  if finished_at is None or report.finished_at > finished_at:
+                      finished_at = report.finished_at
+
+          if run_id is None:
+              run_id = 'no-data'
+              started_at = started_at or __import__('datetime').datetime.now(__import__('datetime').UTC)
+              finished_at = finished_at or started_at
+
+          merged = RunReport(
+              run_id=run_id,
+              started_at=started_at,
+              finished_at=finished_at,
+              repo_url=repo_url,
+              repo_commit=repo_commit,
+              extensions=merged_exts,
+          )
+
+          summary = RunSummary.from_report(merged)
+
+          out_dir = Path('reports')
+          out_dir.mkdir(parents=True, exist_ok=True)
+
+          json.dump(json.loads(merged.model_dump_json()),
+                    open(out_dir / f'report-{run_id}.json', 'w'), indent=2)
+          json.dump(json.loads(summary.model_dump_json()),
+                    open(out_dir / f'summary-{run_id}.json', 'w'), indent=2)
+
+          from anime_ext_test.report.html_report import write_html_report
+          html_path = write_html_report(merged, summary, out_dir)
+          print(f'HTML report: {html_path}')
+
+          print(f'Merged {len(merged_exts)} extensions: {summary.passed}p/{summary.failed}f/{summary.skipped}s/{summary.errors}e')
+          "
+
+      - name: Upload merged reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-test-reports
+          path: reports/
+          retention-days: 30
+
+      - name: Write job summary
+        run: |
+          if [ -f reports/summary-*.json ]; then
+            SUMMARY_FILE=$(ls reports/summary-*.json | head -1)
+            echo "## Test Summary" >> "$GITHUB_STEP_SUMMARY"
+            python -c "
+          import json, sys
+          s = json.load(open('$SUMMARY_FILE'))
+          print(f'- Extensions: {s[\"total_extensions\"]}')
+          print(f'- Assertions: {s[\"total_tests\"]}')
+          print(f'- Passed: {s[\"passed\"]}')
+          print(f'- Failed: {s[\"failed\"]}')
+          print(f'- Skipped: {s[\"skipped\"]}')
+          print(f'- Errors: {s[\"errors\"]}')
+          print(f'- Duration: {s[\"duration_seconds\"]}s')
+          if s.get('by_language'):
+              print()
+              print('| Lang | Pass | Fail | Skip | Error |')
+              print('|------|------|------|------|-------|')
+              for lang in sorted(s['by_language']):
+                  l = s['by_language'][lang]
+                  print(f'| {lang} | {l[\"passed\"]} | {l[\"failed\"]} | {l[\"skipped\"]} | {l[\"errors\"]} |')
+          " >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const glob = require('path').join('reports', 'summary-*.json');
+            const files = require('glob').sync(glob);
+            if (files.length === 0) return;
+            const s = JSON.parse(fs.readFileSync(files[0], 'utf8'));
+            const body = `## 🧪 Extension Test Results\n\n` +
+              `| Metric | Count |\n|--------|-------|\n` +
+              `| Extensions | ${s.total_extensions} |\n` +
+              `| Assertions | ${s.total_tests} |\n` +
+              `| ✅ Passed | ${s.passed} |\n` +
+              `| ❌ Failed | ${s.failed} |\n` +
+              `| ⏭ Skipped | ${s.skipped} |\n` +
+              `| ⚠️ Errors | ${s.errors} |\n` +
+              `| ⏱ Duration | ${s.duration_seconds}s |\n\n` +
+              (s.failed > 0 ? `> ⚠️ **${s.failed} failures** — see merged artifact for details.\n` : `> ✅ All assertions passed!\n`);
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+             });
+
+  deploy-pages:
+    needs: aggregate-reports
+    runs-on: ubuntu-latest
+    if: always() && needs.aggregate-reports.result == 'success'
+    timeout-minutes: 5
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+
+    steps:
+      - name: Download merged reports
+        uses: actions/download-artifact@v4
+        with:
+          name: merged-test-reports
+          path: reports
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: reports
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
