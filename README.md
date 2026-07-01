@@ -149,7 +149,7 @@ Open `reports/report-{run_id}.html` in any browser.
 
 ## GitHub Actions
 
-The CI workflow (`.github/workflows/test-extensions.yml`) provides:
+The CI workflow (`.github/workflows/main.yml`) provides:
 
 | Trigger | Behavior |
 |---------|----------|
