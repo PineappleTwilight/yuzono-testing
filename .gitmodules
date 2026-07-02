@@ -1,0 +1,4 @@
+[submodule "repo"]
+	path = repo
+	url = https://github.com/yuzono/anime-extensions.git
+	branch = master
